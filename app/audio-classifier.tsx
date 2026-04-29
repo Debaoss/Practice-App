@@ -3,8 +3,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { env, pipeline } from "@huggingface/transformers";
 
+const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+
 if (env.backends.onnx?.wasm) {
-  env.backends.onnx.wasm.proxy = true;
+  env.backends.onnx.wasm.proxy = !isSafari;
 }
 
 const MODEL_ID = "onnx-community/ast-finetuned-audioset-10-10-0.4593-ONNX";
@@ -324,9 +326,28 @@ export default function AudioClassifier() {
   }, [verdict, isAudible]);
 
   useEffect(() => {
-    classifierPromiseRef.current ??= pipeline("audio-classification", MODEL_ID, {
-      dtype: "q4",
-    }) as Promise<Classifier>;
+    classifierPromiseRef.current ??= (() => {
+      const loadPromise = pipeline("audio-classification", MODEL_ID, {
+        dtype: "q4",
+      }) as Promise<Classifier>;
+
+      return Promise.race([
+        loadPromise,
+        new Promise<Classifier>((_, reject) =>
+          setTimeout(() => {
+            reject(
+              new Error(
+                `Model loading timeout after 60s${isSafari ? " (Safari detected)" : ""}. Try refreshing the page.`,
+              ),
+            );
+          }, 60_000),
+        ),
+      ]);
+    })();
+
+    if (typeof window !== "undefined") {
+      console.log("Loading audio model. isSafari:", isSafari);
+    }
 
     classifierPromiseRef.current
       .then((classifier) => {
@@ -337,8 +358,9 @@ export default function AudioClassifier() {
         );
       })
       .catch((err: unknown) => {
-        setError(err instanceof Error ? err.message : "Failed to load the instrument model.");
-        setStatus("Model load failed.");
+        const message = err instanceof Error ? err.message : "Failed to load the instrument model.";
+        setError(message);
+        setStatus("Model load failed: " + message);
       });
 
     return () => {
@@ -362,6 +384,17 @@ export default function AudioClassifier() {
       writeIndexRef.current = 0;
       bufferedSamplesRef.current = 0;
     };
+  }, []);
+
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      console.log("Device debug info:", {
+        userAgent: navigator.userAgent,
+        isSafari,
+        platform: navigator.platform,
+        language: navigator.language,
+      });
+    }
   }, []);
 
   const classifyWindow = async () => {
