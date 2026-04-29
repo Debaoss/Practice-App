@@ -102,9 +102,25 @@ function findTarget(value: TargetValue) {
 function getBucketKey(label: string): TargetValue | null {
   const normalized = normalizeLabel(label);
 
+  // Try to match exactly first, then fall back to substring / token matches for robustness.
   for (const option of TARGET_OPTIONS) {
-    if (option.modelLabels.some((candidate) => normalizeLabel(candidate) === normalized)) {
-      return option.value;
+    for (const candidate of option.modelLabels) {
+      const candNorm = normalizeLabel(candidate);
+      if (candNorm === normalized) return option.value;
+    }
+  }
+
+  // Fallback: substring or token overlap matching
+  const tokens = new Set(normalized.split(/\s+/));
+  for (const option of TARGET_OPTIONS) {
+    for (const candidate of option.modelLabels) {
+      const candNorm = normalizeLabel(candidate);
+      if (normalized.includes(candNorm) || candNorm.includes(normalized)) return option.value;
+
+      const candTokens = candNorm.split(/\s+/);
+      for (const t of candTokens) {
+        if (t && tokens.has(t)) return option.value;
+      }
     }
   }
 
