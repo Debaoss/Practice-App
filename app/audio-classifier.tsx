@@ -12,6 +12,7 @@ const TARGET_SAMPLE_RATE = 16_000;
 const WINDOW_SECONDS = 3;
 const CAPTURE_INTERVAL_MS = 120;
 const CLASSIFY_COOLDOWN_MS = 900;
+const SILENCE_DEFAULT_MS = 60_000;
 const MATCH_GRACE_MS = 700;
 
 const TARGET_OPTIONS = [
@@ -261,6 +262,8 @@ export default function AudioClassifier() {
   const timerRunningRef = useRef(timerRunning);
   const timerPausedBySilenceRef = useRef(false);
   const verdictRef = useRef<Verdict>(verdict);
+  const silentSinceRef = useRef<number | null>(null);
+  const defaultedToVoiceRef = useRef(false);
   const intervalRef = useRef<number | null>(null);
   const ringBufferRef = useRef<Float32Array | null>(null);
   const writeIndexRef = useRef(0);
@@ -456,19 +459,46 @@ export default function AudioClassifier() {
       setIsAudible(nowAudible);
 
       if (!nowAudible) {
+        // mark when the silence period started
+        if (silentSinceRef.current === null) {
+          silentSinceRef.current = performance.now();
+        }
         // auto-pause the timer due to low audio, but remember that we paused it
         if (timerRunningRef.current) {
           timerPausedBySilenceRef.current = true;
           setTimerRunning(false);
         }
       } else {
-        // audio returned: if we auto-paused earlier and the verdict currently matches, resume
+        // audio returned: clear silence start and possibly resume
+        silentSinceRef.current = null;
+        defaultedToVoiceRef.current = false;
+        // if we auto-paused earlier and the verdict currently matches, resume
         if (timerPausedBySilenceRef.current && verdictRef.current?.matched) {
           timerPausedBySilenceRef.current = false;
           setTimerRunning(true);
         } else {
           // clear the auto-pause flag if audible but not resuming
           timerPausedBySilenceRef.current = false;
+        }
+      }
+    }
+
+    // if we've been quiet for long enough, default to voice
+    if (!nowAudible && silentSinceRef.current !== null && !defaultedToVoiceRef.current) {
+      const elapsed = performance.now() - silentSinceRef.current;
+      if (elapsed >= SILENCE_DEFAULT_MS) {
+        // set predictions to Voice bucket and update verdict
+        const voicePrediction: Prediction = { label: findTarget("voice").label, score: 1 };
+        const ranked = TARGET_OPTIONS.map((option) => (option.value === "voice" ? voicePrediction : { label: option.label, score: 0 }));
+        setPredictions(ranked);
+        setVerdict(buildVerdict(targetRef.current, ranked));
+        defaultedToVoiceRef.current = true;
+        setStatus("Quiet for 1 minute — defaulting to Voice");
+
+        // if the user's target is voice, resume timer
+        if (targetRef.current === "voice") {
+          timerPausedBySilenceRef.current = false;
+          setTimerRunning(true);
         }
       }
     }
