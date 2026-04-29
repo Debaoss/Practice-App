@@ -12,6 +12,7 @@ const TARGET_SAMPLE_RATE = 16_000;
 const WINDOW_SECONDS = 3;
 const CAPTURE_INTERVAL_MS = 120;
 const CLASSIFY_COOLDOWN_MS = 900;
+const MATCH_GRACE_MS = 700;
 
 const TARGET_OPTIONS = [
   {
@@ -236,6 +237,7 @@ export default function AudioClassifier() {
   const [timerSeconds, setTimerSeconds] = useState(0);
   const [timerRemainingSeconds, setTimerRemainingSeconds] = useState(60);
   const [timerRunning, setTimerRunning] = useState(false);
+  const [showComplete, setShowComplete] = useState(false);
   const [verdict, setVerdict] = useState<Verdict>({
     headline: "Waiting for audio",
     detail: "Start the microphone, then play or sing into it.",
@@ -265,6 +267,7 @@ export default function AudioClassifier() {
   const bufferedSamplesRef = useRef(0);
   const inFlightRef = useRef(false);
   const lastClassifiedAtRef = useRef(0);
+  const lastMatchedAtRef = useRef(0);
   const targetRef = useRef(targetValue);
   const timerDurationSeconds = Math.max(1, timerMinutes * 60 + timerSeconds);
 
@@ -281,16 +284,20 @@ export default function AudioClassifier() {
       setTimerRemainingSeconds((current) => {
         if (current <= 0) {
           setTimerRunning(false);
+          setShowComplete(true);
           return 0;
         }
 
-        if (!isListening || !verdict.matched) {
+        const now = performance.now();
+        const recentlyMatched = verdict.matched || now - lastMatchedAtRef.current < MATCH_GRACE_MS;
+        if (!isListening || !recentlyMatched) {
           return current;
         }
 
         const nextValue = Math.max(0, current - 1);
         if (nextValue === 0) {
           setTimerRunning(false);
+          setShowComplete(true);
         }
 
         return nextValue;
@@ -387,7 +394,11 @@ export default function AudioClassifier() {
 
       const ranked = bucketPredictions(Array.isArray(output) ? output : []);
       setPredictions(ranked);
-      setVerdict(buildVerdict(targetRef.current, ranked));
+      const v = buildVerdict(targetRef.current, ranked);
+      setVerdict(v);
+      if (v.matched) {
+        lastMatchedAtRef.current = performance.now();
+      }
       lastClassifiedAtRef.current = performance.now();
       setStatus("Listening for piano or voice...");
     } catch (err) {
@@ -853,6 +864,25 @@ export default function AudioClassifier() {
           </>
         )}
       </aside>
+      {showComplete ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/50" />
+          <div className="relative z-10 max-w-md rounded-lg bg-slate-900/90 p-6 text-stone-200">
+            <h3 className="text-2xl font-semibold text-white">Timer complete</h3>
+            <p className="mt-2 text-sm">Your countdown has finished.</p>
+            <div className="mt-4 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setShowComplete(false)}
+                className="rounded-full bg-amber-300 px-4 py-2 text-sm font-semibold text-slate-950"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
+
