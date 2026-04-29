@@ -99,6 +99,38 @@ function findTarget(value: TargetValue) {
   return TARGET_OPTIONS.find((target) => target.value === value) ?? TARGET_OPTIONS[0];
 }
 
+function getBucketKey(label: string): TargetValue | null {
+  const normalized = normalizeLabel(label);
+
+  for (const option of TARGET_OPTIONS) {
+    if (option.modelLabels.some((candidate) => normalizeLabel(candidate) === normalized)) {
+      return option.value;
+    }
+  }
+
+  return null;
+}
+
+function bucketPredictions(predictions: Prediction[]) {
+  const buckets = new Map<TargetValue, Prediction>();
+
+  for (const prediction of predictions) {
+    const bucketKey = getBucketKey(prediction.label);
+    if (!bucketKey) {
+      continue;
+    }
+
+    const current = buckets.get(bucketKey);
+    if (!current || prediction.score > current.score) {
+      buckets.set(bucketKey, { label: findTarget(bucketKey).label, score: prediction.score });
+    }
+  }
+
+  return TARGET_OPTIONS.map((option) => buckets.get(option.value) ?? { label: option.label, score: 0 }).sort(
+    (left, right) => right.score - left.score,
+  );
+}
+
 function formatDuration(totalSeconds: number) {
   const safeSeconds = Math.max(0, totalSeconds);
   const minutes = Math.floor(safeSeconds / 60);
@@ -152,29 +184,27 @@ function extractLatestWindow(
 function buildVerdict(targetValue: TargetValue, predictions: Prediction[]): Verdict {
   const target = findTarget(targetValue);
   const top = predictions[0] ?? { label: "unknown", score: 0 };
-  const targetPrediction = predictions.find((prediction) =>
-    target.modelLabels.some((candidate) => normalizeLabel(candidate) === normalizeLabel(prediction.label)),
-  );
 
-  const confidence = Math.round((targetPrediction?.score ?? top.score) * 100);
-  const matchedLabel = targetPrediction?.label ?? top.label;
+  const topLabel = top.label;
+  const confidence = Math.round(top.score * 100);
+  const matched = normalizeLabel(topLabel) === normalizeLabel(target.label) && top.score > 0;
 
-  if (targetPrediction) {
+  if (matched) {
     return {
       matched: true,
       headline: `Likely ${target.label}`,
-      detail: `The model is hearing ${titleCase(matchedLabel)}.`,
+      detail: `The model is hearing ${titleCase(topLabel)}.`,
       confidence,
-      topLabel: matchedLabel,
+      topLabel,
     };
   }
 
   return {
     matched: false,
-    headline: `More like ${titleCase(top.label)}`,
+    headline: `More like ${titleCase(topLabel)}`,
     detail: `That window does not look like ${target.label} right now.`,
     confidence,
-    topLabel: top.label,
+    topLabel,
   };
 }
 
@@ -205,6 +235,11 @@ export default function AudioClassifier() {
   const streamRef = useRef<MediaStream | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
+  const isAudibleRef = useRef(true);
+  const [isAudible, setIsAudible] = useState(true);
+  const silentFramesRef = useRef(0);
+  const rmsRef = useRef(0);
+  const [rms, setRms] = useState(0);
   const intervalRef = useRef<number | null>(null);
   const ringBufferRef = useRef<Float32Array | null>(null);
   const writeIndexRef = useRef(0);
@@ -318,11 +353,11 @@ export default function AudioClassifier() {
         output = (await classifier({ array: audio, sampling_rate: TARGET_SAMPLE_RATE })) as Prediction[];
       }
 
-      const ranked = Array.isArray(output) ? output.slice(0, 3) : [];
+      const ranked = bucketPredictions(Array.isArray(output) ? output : []);
       setPredictions(ranked);
       setVerdict(buildVerdict(targetRef.current, ranked));
       lastClassifiedAtRef.current = performance.now();
-      setStatus(`Listening for ${findTarget(targetRef.current).label.toLowerCase()}...`);
+      setStatus("Listening for piano or voice...");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Classification failed.");
       setStatus("Classification failed.");
@@ -354,6 +389,33 @@ export default function AudioClassifier() {
     writeIndexRef.current = writeIndex;
     bufferedSamplesRef.current = bufferedSamples;
     setBufferProgress(bufferedSamples / ringBuffer.length);
+
+    // compute RMS to detect silence/low volume
+    let sum = 0;
+    for (let i = 0; i < chunk.length; i++) {
+      const s = chunk[i];
+      sum += s * s;
+    }
+    const rms = Math.sqrt(sum / chunk.length) || 0;
+    rmsRef.current = rms;
+    setRms(rms);
+    const AUDIBLE_RMS_THRESHOLD = 0.01;
+
+    if (rms < AUDIBLE_RMS_THRESHOLD) {
+      silentFramesRef.current += 1;
+    } else {
+      silentFramesRef.current = 0;
+    }
+
+    const nowAudible = silentFramesRef.current < 3;
+    if (nowAudible !== isAudibleRef.current) {
+      isAudibleRef.current = nowAudible;
+      setIsAudible(nowAudible);
+      // auto-pause the timer when audio is too quiet
+      if (!nowAudible && timerRunning) {
+        setTimerRunning(false);
+      }
+    }
 
     const now = performance.now();
     if (
@@ -399,7 +461,7 @@ export default function AudioClassifier() {
 
       setIsListening(true);
       setBufferProgress(0);
-      setStatus(modelReady ? "Listening for instrument sounds..." : "Microphone ready. Loading model...");
+      setStatus(modelReady ? "Listening for piano or voice..." : "Microphone ready. Loading model...");
 
       intervalRef.current = window.setInterval(captureAudioTick, CAPTURE_INTERVAL_MS);
 
@@ -408,7 +470,7 @@ export default function AudioClassifier() {
         const classifier = await classifierPromiseRef.current;
         classifierRef.current = classifier;
         setModelReady(true);
-        setStatus("Listening for instrument sounds...");
+        setStatus("Listening for piano or voice...");
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not access the microphone.");
@@ -468,19 +530,17 @@ export default function AudioClassifier() {
     }
 
     if (timerRunning) {
-      return isListening
-        ? verdict.matched
-          ? "Instrument detected. Timer is running."
-          : `Waiting for ${target.label.toLowerCase()} to appear before the countdown moves.`
-        : "Start the microphone first, then the timer will only move while the instrument is detected.";
+      if (!isListening) return "Start the microphone first, then the timer will only move while the instrument is detected.";
+      if (!isAudible) return "Paused — audio too quiet.";
+      return verdict.matched ? "Instrument detected. Timer is running." : `Waiting for ${target.label.toLowerCase()} to appear before the countdown moves.`;
     }
 
-    return isListening
-      ? verdict.matched
-        ? `Instrument detected. Timer will keep moving for ${target.label}.`
-        : `Waiting for ${target.label.toLowerCase()} to keep the timer moving.`
-      : "Start the microphone to let the timer listen for the instrument.";
-  }, [isListening, target.label, timerRemainingSeconds, timerRunning, verdict.matched]);
+    if (!isListening) return "Start the microphone to let the timer listen for the instrument.";
+    if (!isAudible) return "Paused — audio too quiet.";
+    return verdict.matched
+      ? `Instrument detected. Timer will keep moving for ${target.label}.`
+      : `Waiting for ${target.label.toLowerCase()} to keep the timer moving.`;
+  }, [isListening, isAudible, target.label, timerRemainingSeconds, timerRunning, verdict.matched]);
 
   return (
     <div className="grid min-h-[calc(100vh-4rem)] gap-6 p-6 lg:grid-cols-[1.05fr_0.95fr] lg:p-10">
@@ -652,6 +712,20 @@ export default function AudioClassifier() {
               </div>
             </div>
 
+            <div className="space-y-2 mt-3">
+              <p className="text-xs uppercase tracking-[0.3em] text-stone-400">Volume</p>
+              <div className="h-2 w-full overflow-hidden rounded-full bg-white/10">
+                <div
+                  className="h-full rounded-full bg-emerald-400 transition-all duration-150"
+                  style={{ width: `${Math.min(100, Math.round(rms * 1000))}%` }}
+                />
+              </div>
+              <div className="flex items-center justify-between text-xs text-stone-400">
+                <span>RMS</span>
+                <span>{Math.round(rms * 1000)}%</span>
+              </div>
+            </div>
+
             <div className="rounded-2xl border border-white/8 bg-white/4 p-4 text-sm leading-6 text-stone-300">
               Top prediction: <span className="font-medium text-white">{titleCase(verdict.topLabel)}</span>
             </div>
@@ -703,6 +777,20 @@ export default function AudioClassifier() {
                   className="h-full rounded-full bg-gradient-to-r from-cyan-300 via-amber-300 to-orange-300 transition-all duration-300"
                   style={{ width: `${Math.max(timerPercent, 4)}%` }}
                 />
+              </div>
+            </div>
+
+            <div className="space-y-2 mt-3">
+              <p className="text-xs uppercase tracking-[0.3em] text-stone-400">Volume</p>
+              <div className="h-2 w-full overflow-hidden rounded-full bg-white/10">
+                <div
+                  className="h-full rounded-full bg-emerald-400 transition-all duration-150"
+                  style={{ width: `${Math.min(100, Math.round(rms * 1000))}%` }}
+                />
+              </div>
+              <div className="flex items-center justify-between text-xs text-stone-400">
+                <span>RMS</span>
+                <span>{Math.round(rms * 1000)}%</span>
               </div>
             </div>
 
