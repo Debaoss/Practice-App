@@ -257,6 +257,8 @@ export default function AudioClassifier() {
   const rmsRef = useRef(0);
   const [rms, setRms] = useState(0);
   const timerRunningRef = useRef(timerRunning);
+  const timerPausedBySilenceRef = useRef(false);
+  const verdictRef = useRef<Verdict>(verdict);
   const intervalRef = useRef<number | null>(null);
   const ringBufferRef = useRef<Float32Array | null>(null);
   const writeIndexRef = useRef(0);
@@ -301,6 +303,15 @@ export default function AudioClassifier() {
   useEffect(() => {
     timerRunningRef.current = timerRunning;
   }, [timerRunning]);
+
+  useEffect(() => {
+    verdictRef.current = verdict;
+    // if verdict becomes matched and we were auto-paused by silence and audio is audible, resume
+    if (timerPausedBySilenceRef.current && isAudibleRef.current && verdict.matched) {
+      timerPausedBySilenceRef.current = false;
+      setTimerRunning(true);
+    }
+  }, [verdict, isAudible]);
 
   useEffect(() => {
     classifierPromiseRef.current ??= pipeline("audio-classification", MODEL_ID, {
@@ -420,7 +431,7 @@ export default function AudioClassifier() {
     const rms = Math.sqrt(sum / chunk.length) || 0;
     rmsRef.current = rms;
     setRms(rms);
-    const AUDIBLE_RMS_THRESHOLD = 0.03;
+    const AUDIBLE_RMS_THRESHOLD = 0.01;
 
     if (rms < AUDIBLE_RMS_THRESHOLD) {
       silentFramesRef.current += 1;
@@ -432,9 +443,22 @@ export default function AudioClassifier() {
     if (nowAudible !== isAudibleRef.current) {
       isAudibleRef.current = nowAudible;
       setIsAudible(nowAudible);
-      // auto-pause the timer when audio is too quiet
-      if (!nowAudible && timerRunningRef.current) {
-        setTimerRunning(false);
+
+      if (!nowAudible) {
+        // auto-pause the timer due to low audio, but remember that we paused it
+        if (timerRunningRef.current) {
+          timerPausedBySilenceRef.current = true;
+          setTimerRunning(false);
+        }
+      } else {
+        // audio returned: if we auto-paused earlier and the verdict currently matches, resume
+        if (timerPausedBySilenceRef.current && verdictRef.current?.matched) {
+          timerPausedBySilenceRef.current = false;
+          setTimerRunning(true);
+        } else {
+          // clear the auto-pause flag if audible but not resuming
+          timerPausedBySilenceRef.current = false;
+        }
       }
     }
 
