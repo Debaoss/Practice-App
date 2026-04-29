@@ -256,6 +256,7 @@ export default function AudioClassifier() {
   const silentFramesRef = useRef(0);
   const rmsRef = useRef(0);
   const [rms, setRms] = useState(0);
+  const timerRunningRef = useRef(timerRunning);
   const intervalRef = useRef<number | null>(null);
   const ringBufferRef = useRef<Float32Array | null>(null);
   const writeIndexRef = useRef(0);
@@ -296,6 +297,10 @@ export default function AudioClassifier() {
 
     return () => window.clearInterval(timer);
   }, [isListening, timerRemainingSeconds, timerRunning, verdict.matched]);
+
+  useEffect(() => {
+    timerRunningRef.current = timerRunning;
+  }, [timerRunning]);
 
   useEffect(() => {
     classifierPromiseRef.current ??= pipeline("audio-classification", MODEL_ID, {
@@ -415,7 +420,7 @@ export default function AudioClassifier() {
     const rms = Math.sqrt(sum / chunk.length) || 0;
     rmsRef.current = rms;
     setRms(rms);
-    const AUDIBLE_RMS_THRESHOLD = 0.01;
+    const AUDIBLE_RMS_THRESHOLD = 0.03;
 
     if (rms < AUDIBLE_RMS_THRESHOLD) {
       silentFramesRef.current += 1;
@@ -428,7 +433,7 @@ export default function AudioClassifier() {
       isAudibleRef.current = nowAudible;
       setIsAudible(nowAudible);
       // auto-pause the timer when audio is too quiet
-      if (!nowAudible && timerRunning) {
+      if (!nowAudible && timerRunningRef.current) {
         setTimerRunning(false);
       }
     }
