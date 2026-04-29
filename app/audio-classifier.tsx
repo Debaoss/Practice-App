@@ -4,9 +4,15 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { env, pipeline } from "@huggingface/transformers";
 
 const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+const isAppleDevice = /iPad|iPhone|iPod|Macintosh|Mac OS/i.test(navigator.userAgent);
+const useWebKitMemorySavings = isSafari || isAppleDevice;
 
 if (env.backends.onnx?.wasm) {
-  env.backends.onnx.wasm.proxy = !isSafari;
+  env.backends.onnx.wasm.proxy = !useWebKitMemorySavings;
+  // Disable WASM entirely on Apple devices to avoid memory issues
+  if (useWebKitMemorySavings) {
+    env.backends.onnx.wasm.numThreads = 1;
+  }
 }
 
 const MODEL_ID = "onnx-community/ast-finetuned-audioset-10-10-0.4593-ONNX";
@@ -327,17 +333,47 @@ export default function AudioClassifier() {
 
   useEffect(() => {
     classifierPromiseRef.current ??= (() => {
-      const loadPromise = pipeline("audio-classification", MODEL_ID, {
-        dtype: "q4",
-      }) as Promise<Classifier>;
+      const attemptLoad = async (dtype: string, attemptNum: number): Promise<Classifier> => {
+        console.log(`[Model Load] Attempt ${attemptNum}: dtype=${dtype}, isSafari=${isSafari}`);
+        try {
+          const classifier = (await pipeline("audio-classification", MODEL_ID, {
+            dtype: dtype as "q4" | "q8" | "fp16",
+          })) as Classifier;
+          console.log(`[Model Load] Success with dtype=${dtype}`);
+          return classifier;
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          console.log(`[Model Load] Failed attempt ${attemptNum}: ${errMsg}`);
+          throw err;
+        }
+      };
+
+      const loadWithFallback = async (): Promise<Classifier> => {
+        // Try in order: q4 (default), q8 (more quantized), fp16 (less quantized)
+        const dtypes = useWebKitMemorySavings ? ["q8", "fp16", "q4"] : ["q4", "q8"];
+
+        for (let i = 0; i < dtypes.length; i++) {
+          try {
+            return await attemptLoad(dtypes[i], i + 1);
+          } catch (err) {
+            if (i === dtypes.length - 1) {
+              // Last attempt failed, throw final error
+              throw err;
+            }
+            // Try next dtype
+            await new Promise((resolve) => setTimeout(resolve, 500));
+          }
+        }
+        throw new Error("All load attempts failed");
+      };
 
       return Promise.race([
-        loadPromise,
+        loadWithFallback(),
         new Promise<Classifier>((_, reject) =>
           setTimeout(() => {
             reject(
               new Error(
-                `Model loading timeout after 60s${isSafari ? " (Safari detected)" : ""}. Try refreshing the page.`,
+                `Model loading timeout after 60s${useWebKitMemorySavings ? " (Apple device detected)" : ""}. Try refreshing the page.`,
               ),
             );
           }, 60_000),
@@ -346,7 +382,7 @@ export default function AudioClassifier() {
     })();
 
     if (typeof window !== "undefined") {
-      console.log("Loading audio model. isSafari:", isSafari);
+      console.log("Loading audio model. useWebKitMemorySavings:", useWebKitMemorySavings);
     }
 
     classifierPromiseRef.current
@@ -391,6 +427,8 @@ export default function AudioClassifier() {
       console.log("Device debug info:", {
         userAgent: navigator.userAgent,
         isSafari,
+        isAppleDevice,
+        useWebKitMemorySavings,
         platform: navigator.platform,
         language: navigator.language,
       });
