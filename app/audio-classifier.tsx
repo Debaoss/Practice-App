@@ -608,6 +608,10 @@ export default function AudioClassifier() {
     setTimerRemainingSeconds(timerDurationSeconds);
   }
 
+  function adjustTimerRemaining(deltaSeconds: number) {
+    setTimerRemainingSeconds((current) => Math.max(0, current + deltaSeconds));
+  }
+
   const target = useMemo(() => findTarget(targetValue), [targetValue]);
   const timerPercent = Math.min(100, Math.max(0, (timerRemainingSeconds / timerDurationSeconds) * 100));
   const timerNote = useMemo(() => {
@@ -863,6 +867,54 @@ export default function AudioClassifier() {
                   className="h-full rounded-full bg-gradient-to-r from-cyan-300 via-amber-300 to-orange-300 transition-all duration-300"
                   style={{ width: `${Math.max(timerPercent, 4)}%` }}
                 />
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              <p className="text-xs uppercase tracking-[0.24em] text-stone-400">Adjust time</p>
+              <div className="grid grid-cols-3 gap-2">
+                <button
+                  type="button"
+                  onClick={() => adjustTimerRemaining(-60)}
+                  className="rounded-lg border border-white/12 bg-white/5 px-2 py-2 text-xs font-semibold text-white transition hover:bg-white/10"
+                >
+                  −1 min
+                </button>
+                <button
+                  type="button"
+                  onClick={() => adjustTimerRemaining(-180)}
+                  className="rounded-lg border border-white/12 bg-white/5 px-2 py-2 text-xs font-semibold text-white transition hover:bg-white/10"
+                >
+                  −3 mins
+                </button>
+                <button
+                  type="button"
+                  onClick={() => adjustTimerRemaining(-300)}
+                  className="rounded-lg border border-white/12 bg-white/5 px-2 py-2 text-xs font-semibold text-white transition hover:bg-white/10"
+                >
+                  −5 mins
+                </button>
+                <button
+                  type="button"
+                  onClick={() => adjustTimerRemaining(60)}
+                  className="rounded-lg border border-white/12 bg-white/5 px-2 py-2 text-xs font-semibold text-white transition hover:bg-white/10"
+                >
+                  +1 min
+                </button>
+                <button
+                  type="button"
+                  onClick={() => adjustTimerRemaining(180)}
+                  className="rounded-lg border border-white/12 bg-white/5 px-2 py-2 text-xs font-semibold text-white transition hover:bg-white/10"
+                >
+                  +3 mins
+                </button>
+                <button
+                  type="button"
+                  onClick={() => adjustTimerRemaining(300)}
+                  className="rounded-lg border border-white/12 bg-white/5 px-2 py-2 text-xs font-semibold text-white transition hover:bg-white/10"
+                >
+                  +5 mins
+                </button>
               </div>
             </div>
 
