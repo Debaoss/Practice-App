@@ -232,9 +232,9 @@ export default function AudioClassifier() {
   const [error, setError] = useState<string | null>(null);
   const [modelReady, setModelReady] = useState(false);
   const [bufferProgress, setBufferProgress] = useState(0);
-  const [timerMinutes, setTimerMinutes] = useState(0);
-  const [timerSeconds, setTimerSeconds] = useState(30);
-  const [timerRemainingSeconds, setTimerRemainingSeconds] = useState(30);
+  const [timerMinutes, setTimerMinutes] = useState(1);
+  const [timerSeconds, setTimerSeconds] = useState(0);
+  const [timerRemainingSeconds, setTimerRemainingSeconds] = useState(60);
   const [timerRunning, setTimerRunning] = useState(false);
   const [verdict, setVerdict] = useState<Verdict>({
     headline: "Waiting for audio",
