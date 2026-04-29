@@ -1,0 +1,683 @@
+"use client";
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import { env, pipeline } from "@huggingface/transformers";
+
+if (env.backends.onnx?.wasm) {
+  env.backends.onnx.wasm.proxy = true;
+}
+
+const MODEL_ID = "onnx-community/Musical-Instrument-Classification-ONNX";
+const TARGET_SAMPLE_RATE = 16_000;
+const WINDOW_SECONDS = 3;
+const CAPTURE_INTERVAL_MS = 120;
+const CLASSIFY_COOLDOWN_MS = 900;
+
+const TARGET_OPTIONS = [
+  { value: "piano", label: "Piano / Keyboard", modelLabels: ["keyboard"] },
+  { value: "acoustic-guitar", label: "Acoustic Guitar", modelLabels: ["acoustic guitar"] },
+  { value: "bass-guitar", label: "Bass Guitar", modelLabels: ["bass guitar"] },
+  { value: "drum-set", label: "Drum Set", modelLabels: ["drum set"] },
+  { value: "electric-guitar", label: "Electric Guitar", modelLabels: ["electric guitar"] },
+  { value: "flute", label: "Flute", modelLabels: ["flute"] },
+  { value: "hi-hats", label: "Hi-Hats", modelLabels: ["hi-hats"] },
+  { value: "trumpet", label: "Trumpet", modelLabels: ["trumpet"] },
+  { value: "violin", label: "Violin", modelLabels: ["violin"] },
+] as const;
+
+type TargetValue = (typeof TARGET_OPTIONS)[number]["value"];
+type Prediction = {
+  label: string;
+  score: number;
+};
+
+type ClassifierInput = Float32Array | { array: Float32Array; sampling_rate: number };
+type Classifier = (audio: ClassifierInput) => Promise<Prediction[]>;
+
+type Verdict = {
+  headline: string;
+  detail: string;
+  confidence: number;
+  matched: boolean;
+  topLabel: string;
+};
+
+type ActiveTab = "classifier" | "timer";
+
+function normalizeLabel(label: string) {
+  return label.toLowerCase().replace(/[_-]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function titleCase(label: string) {
+  return normalizeLabel(label).replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function findTarget(value: TargetValue) {
+  return TARGET_OPTIONS.find((target) => target.value === value) ?? TARGET_OPTIONS[0];
+}
+
+function formatDuration(totalSeconds: number) {
+  const safeSeconds = Math.max(0, totalSeconds);
+  const minutes = Math.floor(safeSeconds / 60);
+  const seconds = safeSeconds % 60;
+
+  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+}
+
+function resampleLinear(input: Float32Array, sourceRate: number, targetRate: number) {
+  if (sourceRate === targetRate) {
+    return input;
+  }
+
+  const ratio = sourceRate / targetRate;
+  const outputLength = Math.max(1, Math.floor(input.length / ratio));
+  const output = new Float32Array(outputLength);
+
+  for (let index = 0; index < outputLength; index += 1) {
+    const position = index * ratio;
+    const leftIndex = Math.floor(position);
+    const rightIndex = Math.min(input.length - 1, leftIndex + 1);
+    const weight = position - leftIndex;
+    output[index] = input[leftIndex] * (1 - weight) + input[rightIndex] * weight;
+  }
+
+  return output;
+}
+
+function extractLatestWindow(
+  buffer: Float32Array,
+  writeIndex: number,
+  availableSamples: number,
+) {
+  if (availableSamples < buffer.length) {
+    return null;
+  }
+
+  const start = writeIndex;
+  const end = writeIndex + buffer.length;
+
+  if (end <= buffer.length) {
+    return buffer.slice(start, end);
+  }
+
+  const wrapped = new Float32Array(buffer.length);
+  wrapped.set(buffer.subarray(start));
+  wrapped.set(buffer.subarray(0, end - buffer.length), buffer.length - start);
+  return wrapped;
+}
+
+function buildVerdict(targetValue: TargetValue, predictions: Prediction[]): Verdict {
+  const target = findTarget(targetValue);
+  const top = predictions[0] ?? { label: "unknown", score: 0 };
+  const topNormalized = normalizeLabel(top.label);
+  const targetMatch = target.modelLabels.some((candidate) => normalizeLabel(candidate) === topNormalized);
+  const targetPrediction = predictions.find((prediction) =>
+    target.modelLabels.some((candidate) => normalizeLabel(candidate) === normalizeLabel(prediction.label)),
+  );
+
+  const confidence = Math.round((targetPrediction?.score ?? top.score) * 100);
+
+  if (targetMatch || targetPrediction) {
+    return {
+      matched: true,
+      headline: `Likely ${target.label}`,
+      detail: `The model's top matches point to ${titleCase(top.label)}.`,
+      confidence,
+      topLabel: top.label,
+    };
+  }
+
+  return {
+    matched: false,
+    headline: `More like ${titleCase(top.label)}`,
+    detail: `That window does not look like ${target.label} right now.`,
+    confidence,
+    topLabel: top.label,
+  };
+}
+
+export default function AudioClassifier() {
+  const [activeTab, setActiveTab] = useState<ActiveTab>("classifier");
+  const [targetValue, setTargetValue] = useState<TargetValue>("piano");
+  const [isListening, setIsListening] = useState(false);
+  const [status, setStatus] = useState("Idle. Start the microphone to begin.");
+  const [error, setError] = useState<string | null>(null);
+  const [modelReady, setModelReady] = useState(false);
+  const [bufferProgress, setBufferProgress] = useState(0);
+  const [timerMinutes, setTimerMinutes] = useState(0);
+  const [timerSeconds, setTimerSeconds] = useState(30);
+  const [timerRemainingSeconds, setTimerRemainingSeconds] = useState(30);
+  const [timerRunning, setTimerRunning] = useState(false);
+  const [verdict, setVerdict] = useState<Verdict>({
+    headline: "Waiting for audio",
+    detail: "Start the microphone, then play or sing into it.",
+    confidence: 0,
+    matched: false,
+    topLabel: "unknown",
+  });
+  const [predictions, setPredictions] = useState<Prediction[]>([]);
+
+  const classifierPromiseRef = useRef<Promise<Classifier> | null>(null);
+  const classifierRef = useRef<Classifier | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const intervalRef = useRef<number | null>(null);
+  const ringBufferRef = useRef<Float32Array | null>(null);
+  const writeIndexRef = useRef(0);
+  const bufferedSamplesRef = useRef(0);
+  const inFlightRef = useRef(false);
+  const lastClassifiedAtRef = useRef(0);
+  const targetRef = useRef(targetValue);
+  const timerDurationSeconds = Math.max(1, timerMinutes * 60 + timerSeconds);
+
+  useEffect(() => {
+    targetRef.current = targetValue;
+  }, [targetValue]);
+
+  useEffect(() => {
+    if (!timerRunning) {
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      setTimerRemainingSeconds((current) => {
+        if (current <= 0) {
+          setTimerRunning(false);
+          return 0;
+        }
+
+        if (!isListening || !verdict.matched) {
+          return current;
+        }
+
+        const nextValue = Math.max(0, current - 1);
+        if (nextValue === 0) {
+          setTimerRunning(false);
+        }
+
+        return nextValue;
+      });
+    }, 1000);
+
+    return () => window.clearInterval(timer);
+  }, [isListening, timerRemainingSeconds, timerRunning, verdict.matched]);
+
+  useEffect(() => {
+    classifierPromiseRef.current ??= pipeline("audio-classification", MODEL_ID, {
+      dtype: "q4",
+    }) as Promise<Classifier>;
+
+    classifierPromiseRef.current
+      .then((classifier) => {
+        classifierRef.current = classifier;
+        setModelReady(true);
+        setStatus((current) =>
+          current === "Idle. Start the microphone to begin." ? "Model ready. Start the microphone to begin." : current,
+        );
+      })
+      .catch((err: unknown) => {
+        setError(err instanceof Error ? err.message : "Failed to load the instrument model.");
+        setStatus("Model load failed.");
+      });
+
+    return () => {
+      if (intervalRef.current !== null) {
+        window.clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+
+      sourceRef.current?.disconnect();
+      analyserRef.current?.disconnect();
+      sourceRef.current = null;
+      analyserRef.current = null;
+
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+
+      void audioContextRef.current?.close();
+      audioContextRef.current = null;
+
+      ringBufferRef.current = null;
+      writeIndexRef.current = 0;
+      bufferedSamplesRef.current = 0;
+    };
+  }, []);
+
+  const classifyWindow = async () => {
+    if (inFlightRef.current) {
+      return;
+    }
+
+    const classifier = classifierRef.current;
+    const audioContext = audioContextRef.current;
+    const ringBuffer = ringBufferRef.current;
+
+    if (!classifier || !audioContext || !ringBuffer) {
+      return;
+    }
+
+    const latestWindow = extractLatestWindow(ringBuffer, writeIndexRef.current, bufferedSamplesRef.current);
+    if (!latestWindow) {
+      return;
+    }
+
+    inFlightRef.current = true;
+    setStatus(`Analyzing ${targetRef.current.replace(/-/g, " ")}...`);
+
+    try {
+      const audio = resampleLinear(latestWindow, audioContext.sampleRate, TARGET_SAMPLE_RATE);
+      let output: Prediction[];
+
+      try {
+        output = (await classifier(audio)) as Prediction[];
+      } catch {
+        output = (await classifier({ array: audio, sampling_rate: TARGET_SAMPLE_RATE })) as Prediction[];
+      }
+
+      const ranked = Array.isArray(output) ? output.slice(0, 3) : [];
+      setPredictions(ranked);
+      setVerdict(buildVerdict(targetRef.current, ranked));
+      lastClassifiedAtRef.current = performance.now();
+      setStatus(`Listening for ${findTarget(targetRef.current).label.toLowerCase()}...`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Classification failed.");
+      setStatus("Classification failed.");
+    } finally {
+      inFlightRef.current = false;
+    }
+  };
+
+  const captureAudioTick = () => {
+    const analyser = analyserRef.current;
+    const ringBuffer = ringBufferRef.current;
+
+    if (!analyser || !ringBuffer) {
+      return;
+    }
+
+    const chunk = new Float32Array(analyser.fftSize);
+    analyser.getFloatTimeDomainData(chunk);
+
+    let writeIndex = writeIndexRef.current;
+    let bufferedSamples = bufferedSamplesRef.current;
+
+    for (let index = 0; index < chunk.length; index += 1) {
+      ringBuffer[writeIndex] = chunk[index];
+      writeIndex = (writeIndex + 1) % ringBuffer.length;
+      bufferedSamples = Math.min(bufferedSamples + 1, ringBuffer.length);
+    }
+
+    writeIndexRef.current = writeIndex;
+    bufferedSamplesRef.current = bufferedSamples;
+    setBufferProgress(bufferedSamples / ringBuffer.length);
+
+    const now = performance.now();
+    if (
+      bufferedSamples >= ringBuffer.length &&
+      now - lastClassifiedAtRef.current >= CLASSIFY_COOLDOWN_MS &&
+      !inFlightRef.current
+    ) {
+      void classifyWindow();
+    }
+  };
+
+  async function startListening() {
+    try {
+      setError(null);
+      setStatus("Requesting microphone access...");
+
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+
+      const audioContextCtor = window.AudioContext ?? (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!audioContextCtor) {
+        throw new Error("This browser does not support AudioContext.");
+      }
+
+      const audioContext = new audioContextCtor({ sampleRate: TARGET_SAMPLE_RATE });
+      await audioContext.resume();
+      audioContextRef.current = audioContext;
+
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 4096;
+      analyser.smoothingTimeConstant = 0.02;
+      analyserRef.current = analyser;
+
+      const source = audioContext.createMediaStreamSource(stream);
+      source.connect(analyser);
+      sourceRef.current = source;
+
+      const captureWindow = new Float32Array(audioContext.sampleRate * WINDOW_SECONDS);
+      ringBufferRef.current = captureWindow;
+      writeIndexRef.current = 0;
+      bufferedSamplesRef.current = 0;
+      lastClassifiedAtRef.current = 0;
+
+      setIsListening(true);
+      setBufferProgress(0);
+      setStatus(modelReady ? "Listening for instrument sounds..." : "Microphone ready. Loading model...");
+
+      intervalRef.current = window.setInterval(captureAudioTick, CAPTURE_INTERVAL_MS);
+
+      if (!classifierRef.current) {
+        setStatus("Loading instrument model...");
+        const classifier = await classifierPromiseRef.current;
+        classifierRef.current = classifier;
+        setModelReady(true);
+        setStatus("Listening for instrument sounds...");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not access the microphone.");
+      setStatus("Microphone unavailable.");
+      void stopListening();
+    }
+  }
+
+  async function stopListening() {
+    if (intervalRef.current !== null) {
+      window.clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+
+    sourceRef.current?.disconnect();
+    analyserRef.current?.disconnect();
+    sourceRef.current = null;
+    analyserRef.current = null;
+
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+
+    if (audioContextRef.current) {
+      await audioContextRef.current.close();
+      audioContextRef.current = null;
+    }
+
+    ringBufferRef.current = null;
+    writeIndexRef.current = 0;
+    bufferedSamplesRef.current = 0;
+    setBufferProgress(0);
+    setIsListening(false);
+    if (!error) {
+      setStatus(modelReady ? "Idle. Start the microphone to begin." : "Idle. Waiting for the model.");
+    }
+  }
+  function startTimer() {
+    const nextDuration = timerDurationSeconds;
+    setTimerRemainingSeconds(nextDuration);
+    setTimerRunning(true);
+  }
+
+  function pauseTimer() {
+    setTimerRunning(false);
+  }
+
+  function resetTimer() {
+    setTimerRunning(false);
+    setTimerRemainingSeconds(timerDurationSeconds);
+  }
+
+  const target = useMemo(() => findTarget(targetValue), [targetValue]);
+  const timerPercent = Math.min(100, Math.max(0, (timerRemainingSeconds / timerDurationSeconds) * 100));
+  const timerNote = useMemo(() => {
+    if (timerRemainingSeconds <= 0) {
+      return "Timer complete.";
+    }
+
+    if (timerRunning) {
+      return isListening
+        ? verdict.matched
+          ? "Instrument detected. Timer is running."
+          : `Waiting for ${target.label.toLowerCase()} to appear before the countdown moves.`
+        : "Start the microphone first, then the timer will only move while the instrument is detected.";
+    }
+
+    return isListening
+      ? verdict.matched
+        ? `Instrument detected. Timer will keep moving for ${target.label}.`
+        : `Waiting for ${target.label.toLowerCase()} to keep the timer moving.`
+      : "Start the microphone to let the timer listen for the instrument.";
+  }, [isListening, target.label, timerRemainingSeconds, timerRunning, verdict.matched]);
+
+  return (
+    <div className="grid min-h-[calc(100vh-4rem)] gap-6 p-6 lg:grid-cols-[1.05fr_0.95fr] lg:p-10">
+      <section className="flex flex-col justify-between gap-8">
+        <div className="space-y-6">
+          <div className="inline-flex items-center gap-3 rounded-full border border-amber-200/20 bg-amber-200/10 px-4 py-2 text-xs font-semibold uppercase tracking-[0.28em] text-amber-100/90">
+            Real-time pretrained classifier
+          </div>
+
+          <div className="space-y-4">
+            <h1 className="max-w-2xl text-4xl font-semibold tracking-tight text-balance text-white md:text-6xl">
+              Listen to the microphone and check whether the sound matches a chosen instrument.
+            </h1>
+            <p className="max-w-2xl text-base leading-7 text-stone-300 md:text-lg">
+              This version uses a pretrained audio-classification model in the browser. It buffers a 3-second
+              window, scores the instrument classes, and compares the top prediction against your selected target.
+            </p>
+          </div>
+
+          <div className="inline-flex rounded-full border border-white/10 bg-black/20 p-1 text-sm text-stone-300">
+            <button
+              type="button"
+              onClick={() => setActiveTab("classifier")}
+              className={`rounded-full px-4 py-2 transition ${
+                activeTab === "classifier" ? "bg-amber-300 text-slate-950" : "hover:text-white"
+              }`}
+            >
+              Classifier
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab("timer")}
+              className={`rounded-full px-4 py-2 transition ${
+                activeTab === "timer" ? "bg-amber-300 text-slate-950" : "hover:text-white"
+              }`}
+            >
+              Timer
+            </button>
+          </div>
+
+          <div className="grid gap-3 sm:grid-cols-3">
+            <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
+              <p className="text-xs uppercase tracking-[0.24em] text-stone-400">Status</p>
+              <p className="mt-3 text-lg font-medium text-white">{status}</p>
+            </div>
+            <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
+              <p className="text-xs uppercase tracking-[0.24em] text-stone-400">Target</p>
+              <p className="mt-3 text-lg font-medium text-white">{target.label}</p>
+            </div>
+            <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
+              <p className="text-xs uppercase tracking-[0.24em] text-stone-400">Buffer</p>
+              <p className="mt-3 text-lg font-medium text-white">{Math.round(bufferProgress * 100)}%</p>
+            </div>
+          </div>
+        </div>
+
+        {activeTab === "classifier" ? (
+          <div className="flex flex-col gap-4 sm:flex-row">
+            <button
+              type="button"
+              onClick={isListening ? stopListening : startListening}
+              className="inline-flex min-h-12 items-center justify-center rounded-full bg-amber-300 px-6 text-sm font-semibold text-slate-950 transition-transform hover:-translate-y-0.5 hover:bg-amber-200 focus:outline-none focus:ring-2 focus:ring-amber-200 focus:ring-offset-2 focus:ring-offset-slate-950"
+            >
+              {isListening ? "Stop microphone" : "Start microphone"}
+            </button>
+
+            <label className="flex min-h-12 items-center gap-3 rounded-full border border-white/12 bg-black/20 px-4 text-sm text-stone-200">
+              <span className="whitespace-nowrap text-stone-400">Target instrument</span>
+              <select
+                value={targetValue}
+                onChange={(event) => setTargetValue(event.target.value as TargetValue)}
+                className="h-10 flex-1 rounded-full border border-white/10 bg-white/8 px-4 text-sm text-white outline-none transition focus:border-amber-200/70"
+              >
+                {TARGET_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value} className="bg-slate-900">
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+        ) : (
+          <div className="space-y-4 rounded-[1.5rem] border border-white/10 bg-black/20 p-5">
+            <div className="grid gap-3 sm:grid-cols-3">
+              <label className="flex items-center gap-3 rounded-full border border-white/12 bg-white/5 px-4 py-3 text-sm text-stone-200">
+                <span className="whitespace-nowrap text-stone-400">Minutes</span>
+                <input
+                  type="number"
+                  min="0"
+                  max="59"
+                  value={timerMinutes}
+                  onChange={(event) => setTimerMinutes(Number.parseInt(event.target.value || "0", 10) || 0)}
+                  className="w-full bg-transparent text-right text-white outline-none"
+                />
+              </label>
+              <label className="flex items-center gap-3 rounded-full border border-white/12 bg-white/5 px-4 py-3 text-sm text-stone-200">
+                <span className="whitespace-nowrap text-stone-400">Seconds</span>
+                <input
+                  type="number"
+                  min="0"
+                  max="59"
+                  value={timerSeconds}
+                  onChange={(event) => setTimerSeconds(Number.parseInt(event.target.value || "0", 10) || 0)}
+                  className="w-full bg-transparent text-right text-white outline-none"
+                />
+              </label>
+              <label className="flex items-center gap-3 rounded-full border border-white/12 bg-white/5 px-4 py-3 text-sm text-stone-200">
+                <span className="whitespace-nowrap text-stone-400">Target</span>
+                <span className="truncate text-right text-white">{target.label}</span>
+              </label>
+            </div>
+
+            <div className="flex flex-wrap gap-3">
+              <button
+                type="button"
+                onClick={startTimer}
+                className="inline-flex min-h-12 items-center justify-center rounded-full bg-amber-300 px-6 text-sm font-semibold text-slate-950 transition-transform hover:-translate-y-0.5 hover:bg-amber-200 focus:outline-none focus:ring-2 focus:ring-amber-200 focus:ring-offset-2 focus:ring-offset-slate-950"
+              >
+                {timerRunning ? "Restart timer" : "Start timer"}
+              </button>
+              <button
+                type="button"
+                onClick={pauseTimer}
+                className="inline-flex min-h-12 items-center justify-center rounded-full border border-white/12 bg-white/5 px-6 text-sm font-semibold text-white transition hover:bg-white/10"
+              >
+                Pause
+              </button>
+              <button
+                type="button"
+                onClick={resetTimer}
+                className="inline-flex min-h-12 items-center justify-center rounded-full border border-white/12 bg-white/5 px-6 text-sm font-semibold text-white transition hover:bg-white/10"
+              >
+                Reset
+              </button>
+            </div>
+
+            <p className="text-sm leading-6 text-stone-300">{timerNote}</p>
+          </div>
+        )}
+
+        {error ? (
+          <p className="max-w-2xl rounded-2xl border border-rose-300/20 bg-rose-400/10 px-4 py-3 text-sm text-rose-100">
+            {error}
+          </p>
+        ) : null}
+      </section>
+
+      <aside className="flex flex-col gap-6 rounded-[1.75rem] border border-white/10 bg-slate-950/50 p-6 shadow-inner shadow-black/30">
+        {activeTab === "classifier" ? (
+          <>
+            <div className="space-y-4">
+              <p className="text-xs uppercase tracking-[0.3em] text-stone-400">Current verdict</p>
+              <div>
+                <h2 className="text-3xl font-semibold tracking-tight text-white">{verdict.headline}</h2>
+                <p className="mt-3 text-sm leading-6 text-stone-300">{verdict.detail}</p>
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              <div className="flex items-center justify-between text-sm text-stone-300">
+                <span>Confidence</span>
+                <span>{verdict.confidence}%</span>
+              </div>
+              <div className="h-3 overflow-hidden rounded-full bg-white/10">
+                <div
+                  className="h-full rounded-full bg-gradient-to-r from-amber-300 via-orange-300 to-cyan-300 transition-all duration-300"
+                  style={{ width: `${Math.max(verdict.confidence, 6)}%` }}
+                />
+              </div>
+            </div>
+
+            <div className="rounded-2xl border border-white/8 bg-white/4 p-4 text-sm leading-6 text-stone-300">
+              Top prediction: <span className="font-medium text-white">{titleCase(verdict.topLabel)}</span>
+            </div>
+
+            <div className="grid gap-3 sm:grid-cols-2">
+              {predictions.length > 0 ? (
+                predictions.map((prediction) => (
+                  <div
+                    key={prediction.label}
+                    className="rounded-2xl border border-white/8 bg-white/4 p-4 text-stone-300"
+                  >
+                    <p className="text-sm font-medium text-white">{titleCase(prediction.label)}</p>
+                    <p className="mt-2 text-xs leading-5 text-inherit/75">
+                      {Math.round(prediction.score * 100)}% confidence
+                    </p>
+                  </div>
+                ))
+              ) : (
+                <div className="rounded-2xl border border-white/8 bg-white/4 p-4 text-sm text-stone-300 sm:col-span-2">
+                  Predictions will appear once the buffer fills and the model runs.
+                </div>
+              )}
+            </div>
+
+            <div className="rounded-2xl border border-cyan-200/15 bg-cyan-300/5 p-4 text-sm leading-6 text-stone-300">
+              The model is quantized and runs locally in the browser. For piano input, the closest model class is
+              keyboard, so the selector uses “Piano / Keyboard” as the target.
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="space-y-4">
+              <p className="text-xs uppercase tracking-[0.3em] text-stone-400">Timer</p>
+              <div>
+                <h2 className="text-5xl font-semibold tracking-tight text-white">{formatDuration(timerRemainingSeconds)}</h2>
+                <p className="mt-3 text-sm leading-6 text-stone-300">
+                  This countdown only moves while the selected instrument is being detected by the microphone.
+                </p>
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              <div className="flex items-center justify-between text-sm text-stone-300">
+                <span>Progress</span>
+                <span>{Math.round(timerPercent)}%</span>
+              </div>
+              <div className="h-3 overflow-hidden rounded-full bg-white/10">
+                <div
+                  className="h-full rounded-full bg-gradient-to-r from-cyan-300 via-amber-300 to-orange-300 transition-all duration-300"
+                  style={{ width: `${Math.max(timerPercent, 4)}%` }}
+                />
+              </div>
+            </div>
+
+            <div className="rounded-2xl border border-white/8 bg-white/4 p-4 text-sm leading-6 text-stone-300">
+              Listening state: <span className="font-medium text-white">{isListening ? "Microphone active" : "Microphone off"}</span>
+            </div>
+
+            <div className="rounded-2xl border border-white/8 bg-white/4 p-4 text-sm leading-6 text-stone-300">
+              Detection state: <span className="font-medium text-white">{verdict.matched ? `Matching ${target.label}` : `Waiting for ${target.label}`}</span>
+            </div>
+
+            <div className="rounded-2xl border border-cyan-200/15 bg-cyan-300/5 p-4 text-sm leading-6 text-stone-300">
+              Start the microphone first, then the timer will only move while the instrument is detected.
+            </div>
+          </>
+        )}
+      </aside>
+    </div>
+  );
+}
