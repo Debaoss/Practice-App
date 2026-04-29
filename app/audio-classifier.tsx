@@ -8,6 +8,14 @@ const isAppleDevice = /iPad|iPhone|iPod|Macintosh|Mac OS/i.test(navigator.userAg
 const useWebKitMemorySavings = isSafari || isAppleDevice;
 
 if (env.backends.onnx?.wasm) {
+  if (useWebKitMemorySavings && env.backends.onnx.versions?.web) {
+    const wasmPathPrefix = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${env.backends.onnx.versions.web}/dist/`;
+    env.backends.onnx.wasm.wasmPaths = {
+      mjs: `${wasmPathPrefix}ort-wasm-simd-threaded.mjs`,
+      wasm: `${wasmPathPrefix}ort-wasm-simd-threaded.wasm`,
+    };
+  }
+
   env.backends.onnx.wasm.proxy = !useWebKitMemorySavings;
   // Disable WASM entirely on Apple devices to avoid memory issues
   if (useWebKitMemorySavings) {
