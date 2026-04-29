@@ -7,22 +7,65 @@ if (env.backends.onnx?.wasm) {
   env.backends.onnx.wasm.proxy = true;
 }
 
-const MODEL_ID = "onnx-community/Musical-Instrument-Classification-ONNX";
+const MODEL_ID = "onnx-community/ast-finetuned-audioset-10-10-0.4593-ONNX";
 const TARGET_SAMPLE_RATE = 16_000;
 const WINDOW_SECONDS = 3;
 const CAPTURE_INTERVAL_MS = 120;
 const CLASSIFY_COOLDOWN_MS = 900;
 
 const TARGET_OPTIONS = [
-  { value: "piano", label: "Piano / Keyboard", modelLabels: ["keyboard"] },
-  { value: "acoustic-guitar", label: "Acoustic Guitar", modelLabels: ["acoustic guitar"] },
-  { value: "bass-guitar", label: "Bass Guitar", modelLabels: ["bass guitar"] },
-  { value: "drum-set", label: "Drum Set", modelLabels: ["drum set"] },
-  { value: "electric-guitar", label: "Electric Guitar", modelLabels: ["electric guitar"] },
-  { value: "flute", label: "Flute", modelLabels: ["flute"] },
-  { value: "hi-hats", label: "Hi-Hats", modelLabels: ["hi-hats"] },
-  { value: "trumpet", label: "Trumpet", modelLabels: ["trumpet"] },
-  { value: "violin", label: "Violin", modelLabels: ["violin"] },
+  {
+    value: "piano",
+    label: "Piano",
+    modelLabels: ["piano", "keyboard (musical)", "electric piano", "organ", "harpsichord"],
+  },
+  {
+    value: "voice",
+    label: "Voice",
+    modelLabels: [
+      "speech",
+      "male speech, man speaking",
+      "female speech, woman speaking",
+      "child speech, kid speaking",
+      "conversation",
+      "narration, monologue",
+      "babbling",
+      "speech synthesizer",
+      "shout",
+      "bellow",
+      "whoop",
+      "yell",
+      "battle cry",
+      "children shouting",
+      "screaming",
+      "whispering",
+      "laughter",
+      "baby laughter",
+      "giggle",
+      "snicker",
+      "belly laugh",
+      "chuckle, chortle",
+      "crying, sobbing",
+      "baby cry, infant cry",
+      "whimper",
+      "wail, moan",
+      "sigh",
+      "singing",
+      "choir",
+      "yodeling",
+      "chant",
+      "mantra",
+      "male singing",
+      "female singing",
+      "child singing",
+      "synthetic singing",
+      "rapping",
+      "humming",
+      "groan",
+      "grunt",
+      "whistling",
+    ],
+  },
 ] as const;
 
 type TargetValue = (typeof TARGET_OPTIONS)[number]["value"];
@@ -109,21 +152,20 @@ function extractLatestWindow(
 function buildVerdict(targetValue: TargetValue, predictions: Prediction[]): Verdict {
   const target = findTarget(targetValue);
   const top = predictions[0] ?? { label: "unknown", score: 0 };
-  const topNormalized = normalizeLabel(top.label);
-  const targetMatch = target.modelLabels.some((candidate) => normalizeLabel(candidate) === topNormalized);
   const targetPrediction = predictions.find((prediction) =>
     target.modelLabels.some((candidate) => normalizeLabel(candidate) === normalizeLabel(prediction.label)),
   );
 
   const confidence = Math.round((targetPrediction?.score ?? top.score) * 100);
+  const matchedLabel = targetPrediction?.label ?? top.label;
 
-  if (targetMatch || targetPrediction) {
+  if (targetPrediction) {
     return {
       matched: true,
       headline: `Likely ${target.label}`,
-      detail: `The model's top matches point to ${titleCase(top.label)}.`,
+      detail: `The model is hearing ${titleCase(matchedLabel)}.`,
       confidence,
-      topLabel: top.label,
+      topLabel: matchedLabel,
     };
   }
 
@@ -454,7 +496,7 @@ export default function AudioClassifier() {
             </h1>
             <p className="max-w-2xl text-base leading-7 text-stone-300 md:text-lg">
               This version uses a pretrained audio-classification model in the browser. It buffers a 3-second
-              window, scores the instrument classes, and compares the top prediction against your selected target.
+              window, scores the audio classes, and compares the result against piano or human voice.
             </p>
           </div>
 
@@ -506,7 +548,7 @@ export default function AudioClassifier() {
             </button>
 
             <label className="flex min-h-12 items-center gap-3 rounded-full border border-white/12 bg-black/20 px-4 text-sm text-stone-200">
-              <span className="whitespace-nowrap text-stone-400">Target instrument</span>
+              <span className="whitespace-nowrap text-stone-400">Target source</span>
               <select
                 value={targetValue}
                 onChange={(event) => setTargetValue(event.target.value as TargetValue)}
@@ -635,8 +677,8 @@ export default function AudioClassifier() {
             </div>
 
             <div className="rounded-2xl border border-cyan-200/15 bg-cyan-300/5 p-4 text-sm leading-6 text-stone-300">
-              The model is quantized and runs locally in the browser. For piano input, the closest model class is
-              keyboard, so the selector uses “Piano / Keyboard” as the target.
+              The model is quantized and runs locally in the browser. Piano maps to the piano and keyboard-related
+              AudioSet labels, while voice maps to speech, singing, humming, and other human-vocal classes.
             </div>
           </>
         ) : (
